@@ -20,4 +20,122 @@ size_t cws_send_message_to(const uint64_t receiver_id, char * message);
 #endif // CWS_H
 
 #ifdef CWS_IMPL
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#define TEXT_BLUE   "\x1b[38;5;39m"
+#define TEXT_YELLOW "\x1b[38;5;220m"
+#define TEXT_RED    "\x1b[38;5;196m"
+#define TEXT_RESET  "\x1b[39m"
+
+#ifdef CWS_LOCAL
+#define CWS_ADDR htonl(INADDR_LOOPBACK)
+#else
+#define CWS_ADDR INADDR_ANY
+#endif
+
+#ifndef CWS_SERVER_MAX_EVENTS_PER_LOOP
+#define CWS_SERVER_MAX_EVENTS_PER_LOOP 32
+#endif
+
+struct CWS_Socket {
+  uint32_t fd;
+  uint32_t opts;
+  struct sockaddr_in address;
+};
+
+struct CWS_EventPoll {
+  uint32_t fd;
+  uint32_t opts;
+};
+
+struct CWS_Connection;
+
+struct CWS_Server {
+  enum CWS_ServerState {
+    CWS_SERVER_CLOSED,
+    CWS_SERVER_STARTED,
+    CWS_SERVER_RUNNING,
+    CWS_SERVER_CLOSING,
+    CWS_SERVER_STATES
+  } state;
+  struct CWS_Socket socket;
+  struct CWS_EventPoll epoll;
+  struct CWS_Connection * connections;
+};
+
+struct CWS_Server * cws_server_start(const uint16_t port) {
+  struct CWS_Server * server = (struct CWS_Server *)calloc(1, sizeof(struct CWS_Server));
+  if (server == NULL) {
+    printf("%sError allocating server memory: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_alloc;
+  }
+  
+  int sock = 0;
+  if ((sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
+    printf("%sError creating socket endpoint for server: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_sock;
+  }
+  server->socket.fd = sock;
+
+  int sockopts = 0;
+  if (setsockopt(server->socket.fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &sockopts, sizeof(int)) == -1) {
+    printf("%sError configuring socket: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_sockopts;
+  }
+  server->socket.opts = sockopts;
+
+  int epoll;
+  if ((epoll = epoll_create1(0)) == -1) {
+    printf("%sError creating socket event poll: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_epoll;
+  }
+
+  struct epoll_event events = { .data.fd = sock, .events = EPOLLIN };
+  if (epoll_ctl(epoll, EPOLL_CTL_ADD, sock, &events) == -1) {
+    printf("%sError configuring socket event poll: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_epollctl;
+  }
+
+  socklen_t addrLen = sizeof(struct sockaddr_in);
+  server->socket.address.sin_family = AF_INET;
+  server->socket.address.sin_addr.s_addr = CWS_ADDR;
+  server->socket.address.sin_port = htons(port);
+  if (bind(sock, (struct sockaddr *)&(server->socket.address), addrLen) == -1) {
+    printf("%sError binding socket: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_bind;
+  }
+
+  if (listen(sock, CWS_SERVER_MAX_EVENTS_PER_LOOP) == -1) {
+    printf("%sError making socket a listener: %s%s\n", TEXT_RED, strerror(errno), TEXT_RESET);
+    goto fail_listen;
+  }
+
+  printf("%sServer correctly setup%s\n", TEXT_BLUE, TEXT_RESET);
+  server->state = CWS_SERVER_STARTED;
+  return server;
+
+fail_listen:
+fail_bind:
+fail_epollctl:
+  close(epoll);
+fail_epoll:
+fail_sockopts:
+  shutdown(sock, SHUT_RDWR);
+  close(sock);
+fail_sock:
+  free(server);
+  server = NULL;
+fail_alloc:
+  return NULL;
+}
+
 #endif
