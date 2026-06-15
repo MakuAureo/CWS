@@ -1,14 +1,22 @@
 #ifndef CWS_H
 #define CWS_H
 
+#define _GNU_SOURCE
 #include <stdint.h>
 #include <sys/types.h>
 
 typedef struct CWS_Server CWS_Server_t;
+typedef enum CWS_ServerResult CWS_ServerResult_t;
 
-CWS_Server_t * cws_server_start(const uint16_t port);
+enum CWS_ServerResult {
+  CWS_SERVER_NOT_READY,
+  CWS_SERVER_CLEAN_INTERRUPTED,
+  CWS_SERVER_ERROR
+};
+
+int8_t cws_server_init(CWS_Server_t * server, const uint16_t port);
 int8_t cws_server_close(CWS_Server_t * server);
-int8_t cws_server_loop(CWS_Server_t * server);
+CWS_ServerResult_t cws_server_run(CWS_Server_t * server);
 int8_t cws_server_add_valid_path(CWS_Server_t * server, const char * path,
     void(*onConnect)(const uint64_t connection_id),
     void(*onDisconnect)(const uint64_t connection_id),
@@ -19,6 +27,7 @@ size_t cws_send_message_to(const uint64_t receiver_id, char * message);
 
 #endif // CWS_H
 
+#define CWS_IMPL
 #ifdef CWS_IMPL
 
 #include <stdio.h>
@@ -26,6 +35,7 @@ size_t cws_send_message_to(const uint64_t receiver_id, char * message);
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
+#include <signal.h>
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -93,37 +103,38 @@ struct CWS_Server {
     CWS_SERVER_CLOSED,
     CWS_SERVER_STARTED,
     CWS_SERVER_RUNNING,
-    CWS_SERVER_CLOSING,
+    CWS_SERVER_STOPED,
     CWS_SERVER_STATES
   } state;
   struct CWS_Socket socket;
   struct CWS_EventPoll epoll;
   struct CWS_Connection * connections;
+  struct CWS_Worker * threads;
 };
 
-CWS_Server_t * cws_server_start(const uint16_t port) {
-  CWS_Server_t * server = (CWS_Server_t *)calloc(1, sizeof(CWS_Server_t));
+int8_t cws_server_init(CWS_Server_t * server, const uint16_t port)
+{
   if (server == NULL) {
-    printf("%sError allocating server memory: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
+    printf("%sServer pointer is null%s\n", CWS_TEXT_RED, CWS_TEXT_RESET);
     goto fail_alloc;
   }
   
-  int sock = 0;
-  if ((sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)) == -1) {
+  int sock = sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (sock == -1) {
     printf("%sError creating socket endpoint for server: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
     goto fail_sock;
   }
   server->socket.fd = sock;
 
-  int sockopts = 0;
-  if (setsockopt(server->socket.fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &sockopts, sizeof(int)) == -1) {
+  int sockopts = setsockopt(server->socket.fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &sockopts, sizeof(int));
+  if (sockopts == -1) {
     printf("%sError configuring socket: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
     goto fail_sockopts;
   }
   server->socket.opts = sockopts;
 
-  int epoll;
-  if ((epoll = epoll_create1(0)) == -1) {
+  int epoll = epoll_create1(0);
+  if (epoll == -1) {
     printf("%sError creating socket event poll: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
     goto fail_epoll;
   }
@@ -149,9 +160,9 @@ CWS_Server_t * cws_server_start(const uint16_t port) {
     goto fail_listen;
   }
 
-  printf("%sServer correctly setup%s\n", CWS_TEXT_BLUE, CWS_TEXT_RESET);
+  printf("%sServer correctly initialized%s\n", CWS_TEXT_BLUE, CWS_TEXT_RESET);
   server->state = CWS_SERVER_STARTED;
-  return server;
+  return 0;
 
 fail_listen:
 fail_bind:
@@ -162,33 +173,138 @@ fail_sockopts:
   shutdown(sock, SHUT_RDWR);
   close(sock);
 fail_sock:
-  free(server);
-  server = NULL;
 fail_alloc:
+  return -1;
+}
+
+static volatile sig_atomic_t g_sigint = 0;
+static void handle_sigint(int sig) {
+  if (g_sigint == 0) {
+    const char SIGINTWARN[] = CWS_TEXT_YELLOW "SIGINT detected, trying to stop the server cleanly, try signaling SIGINT again if this hangs" CWS_TEXT_RESET "\n";
+    write(STDIN_FILENO, SIGINTWARN, sizeof(SIGINTWARN));
+    g_sigint = 1;
+  } else {
+    const char SIGINTFORCE[] = CWS_TEXT_RED "Forcefully shuting down the server" CWS_TEXT_RESET "\n";
+    write(STDIN_FILENO, SIGINTFORCE, sizeof(SIGINTFORCE));
+    exit(1);
+  }
+}
+
+static void *sigint_listener_job(void* args) {
+  pause();
+  CWS_Server_t * server = args;
+  write(server->epoll.fd, "", 1);
   return NULL;
 }
 
-static struct CWS_Connection * handle_new_connection(CWS_Server_t * server);
+static void *worker_job(void* args);
 
-int8_t cws_server_loop(CWS_Server_t * server) {
+static inline int8_t spawn_worker_threads(CWS_Server_t * server)
+{
+  struct CWS_Worker * threads = calloc(CWS_WORKER_MAX, sizeof(struct CWS_Worker));
+  if (threads == NULL) {
+    printf("%sError allocating threads memory: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
+    goto fail_alloc;
+  }
+
+  for (size_t i = 0; i < CWS_WORKER_MAX; i++) {
+    int epoll = epoll_create1(0);
+    if (epoll == -1) {
+      for (size_t j = 0; j < i; j++)
+        close(threads[j].epoll.fd);
+      printf("%sError creating event poll for thread #%zu: %s%s\n", CWS_TEXT_RED, i, strerror(errno), CWS_TEXT_RESET);
+      goto fail_epoll;
+    }
+    threads[i].epoll.fd = epoll;
+  }
+
+  for (size_t i = 0; i < CWS_WORKER_MAX; i++) {
+    pthread_t id;
+    if (pthread_create(&id, NULL, worker_job, threads + i) == -1) {
+      for (size_t j = 0; j < i; j++)
+        pthread_cancel(threads[j].thread_id);
+      printf("%sError spawning thread #%zu: %s%s\n", CWS_TEXT_RED, i, strerror(errno), CWS_TEXT_RESET);
+      goto fail_thread;
+    }
+    threads[i].thread_id = id;
+    threads[i].state = CWS_WORKER_RUNING;
+  }
+
+  server->threads = threads;
+  return 0;
+
+fail_thread:
+  for (size_t j = 0; j < CWS_WORKER_MAX; j++)
+    close(threads[j].epoll.fd);
+fail_epoll:
+  free(threads);
+  threads = NULL;
+fail_alloc:
+  return -1;
+}
+
+static inline void stop_worker_threads_clean(CWS_Server_t * server);
+static inline void stop_worker_threads_force(CWS_Server_t * server);
+static inline int8_t handle_new_connection(CWS_Server_t * server, struct CWS_Connection * connection);
+
+CWS_ServerResult_t cws_server_run(CWS_Server_t * server)
+{
+  if (server->state != CWS_SERVER_STARTED)
+    return CWS_SERVER_NOT_READY;
+
+  struct sigaction sigint_action = {
+    .sa_handler = handle_sigint
+  };
+  struct sigaction sigint_old;
+  sigaction(SIGINT, &sigint_action, &sigint_old);
+  pthread_t sigint_listener;
+  pthread_create(&sigint_listener, NULL, sigint_listener_job, server);
+
+  sigset_t sigset;
+  sigemptyset(&sigset);
+  sigaddset(&sigset, SIGINT);
+  pthread_sigmask(SIG_BLOCK, &sigset, NULL);
+  if (spawn_worker_threads(server) == -1)
+    goto fail_spawn_threads;
+
+  server->state = CWS_SERVER_RUNNING;
   struct epoll_event event_vec[CWS_SERVER_MAX_EVENTS_PER_LOOP];
   while (server->state == CWS_SERVER_RUNNING) {
     int32_t events = epoll_wait(server->epoll.fd, event_vec, CWS_SERVER_MAX_EVENTS_PER_LOOP, -1);
+    if (g_sigint == 1)
+      goto stop;
     if (events == -1) {
       printf("%sError while waiting for new connecitons: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
       goto fail_epoll_wait;
     }
     for (int32_t i = 0; i < events; i++) {
-      struct CWS_Connection * new_conn = handle_new_connection(server);
-      if (new_conn == NULL) continue;
+      struct CWS_Connection * new_conn = calloc(1, sizeof(struct CWS_Connection));
+      if (new_conn == NULL) {
+        printf("%sError allocating memory for new connection: %s%s\n", CWS_TEXT_RED, strerror(errno), CWS_TEXT_RESET);
+        goto fail_connection_alloc;
+      }
+      if (handle_new_connection(server, new_conn) == -1) {
+        free(new_conn);
+        continue;
+      }
       new_conn->callbacks->onConnect(new_conn->id);
     }
   }
 
-  return 0;
+stop:
+  stop_worker_threads_clean(server);
+  sigaction(SIGINT, &sigint_old, NULL);
+  server->state = CWS_SERVER_STOPED;
+  return CWS_SERVER_CLEAN_INTERRUPTED;
 
+fail_connection_alloc:
 fail_epoll_wait:
-  return -1;
+  stop_worker_threads_force(server);
+fail_spawn_threads:
+  pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+  sigaction(SIGINT, &sigint_old, NULL);
+  server->state = CWS_SERVER_STOPED;
+  return CWS_SERVER_ERROR;
 }
 
 #endif
