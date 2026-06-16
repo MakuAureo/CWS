@@ -155,7 +155,9 @@ int8_t cws_server_init(CWS_Server_t * server, const uint16_t port)
   }
   server->epoll.fd = epoll;
 
-  struct epoll_event events = { .data.fd = sock, .events = EPOLLIN };
+  struct epoll_event events;
+  events.data.fd = sock;
+  events.events = EPOLLIN;
   if (epoll_ctl(epoll, EPOLL_CTL_ADD, sock, &events) == -1) {
     printf(CWS_TEXT_RED "Error configuring socket event poll: %s" CWS_TEXT_RESET "\n", strerror(errno));
     goto fail_epollctl;
@@ -213,7 +215,8 @@ fail_alloc:
 }
 
 static volatile sig_atomic_t g_sigint = 0;
-static void handle_sigint(int sig) {
+static void handle_sigint(int sig)
+{
   if (g_sigint == 0) {
     const char SIGINTWARN[] = CWS_TEXT_YELLOW "SIGINT detected, trying to stop the server cleanly, try signaling SIGINT again if this hangs" CWS_TEXT_RESET "\n";
     write(STDIN_FILENO, SIGINTWARN, sizeof(SIGINTWARN));
@@ -225,14 +228,49 @@ static void handle_sigint(int sig) {
   }
 }
 
-static void *sigint_listener_job(void* args) {
+static void *sigint_listener_job(void* args)
+{
   pause();
   CWS_Server_t * server = args;
   write(server->epoll.fd, "", 1);
   return NULL;
 }
 
-static void *worker_job(void* args);
+static inline int8_t perform_handshake(struct CWS_ConnectionNode * connection);
+
+static void *worker_job(void* args)
+{
+  struct CWS_Worker * self = args;
+  struct epoll_event event_vec[CWS_SERVER_MAX_EVENTS_PER_LOOP];
+  while (self->state == CWS_WORKER_RUNING) {
+    int32_t events = epoll_wait(self->epoll.fd, event_vec, CWS_SERVER_MAX_EVENTS_PER_LOOP, -1);
+    if (g_sigint == 1)
+      goto stop;
+    if (events == -1) {
+      printf(CWS_TEXT_BLUE "Error while reading data for some conneciton: %s" CWS_TEXT_RESET "\n", strerror(errno));
+      goto fail_epoll_wait;
+    }
+    for (int32_t i = 0; i < events; i++) {
+      struct CWS_ConnectionNode * connection = event_vec[i].data.ptr;
+      switch (connection->connection.state) {
+        case CWS_CONNECTION_ACCEPTED:
+          if (perform_handshake(connection) == -1)
+            //Reject conn
+          break;
+        case CWS_CONNECTION_ESTABLISHED:
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+stop:
+  return NULL;
+
+fail_epoll_wait:
+  return NULL;
+}
 
 static inline int8_t spawn_worker_threads(CWS_Server_t * server)
 {
@@ -317,10 +355,9 @@ static inline int8_t handle_new_connection(CWS_Server_t * server, struct CWS_Con
     goto fail_accept;
   }
 
-  struct epoll_event event = {
-    .data.ptr = connection,
-    .events = EPOLLET
-  };
+  struct epoll_event event;
+  event.data.ptr = connection;
+  event.events = EPOLLET;
   size_t next_thread = find_least_loaded_worker(server);
   if (epoll_ctl(server->threads[next_thread].epoll.fd, EPOLL_CTL_ADD, conn, &event) == -1) {
     printf(CWS_TEXT_RED "Error adding new connection to thread#%zu's event poll: %s" CWS_TEXT_RESET "\n", next_thread, strerror(errno));
@@ -356,9 +393,8 @@ CWS_ServerResult_t cws_server_run(CWS_Server_t * server)
   if (server->state != CWS_SERVER_STARTED)
     return CWS_SERVER_NOT_READY;
 
-  struct sigaction sigint_action = {
-    .sa_handler = handle_sigint
-  };
+  struct sigaction sigint_action;
+  sigint_action.sa_handler = handle_sigint;
   struct sigaction sigint_old;
   sigaction(SIGINT, &sigint_action, &sigint_old);
   pthread_t sigint_listener;
@@ -395,8 +431,8 @@ CWS_ServerResult_t cws_server_run(CWS_Server_t * server)
   }
 
 stop:
-  stop_worker_threads_clean(server);
   sigaction(SIGINT, &sigint_old, NULL);
+  stop_worker_threads_clean(server);
   server->state = CWS_SERVER_STOPED;
   return CWS_SERVER_CLEAN_INTERRUPTED;
 
@@ -404,8 +440,9 @@ fail_connection_alloc:
 fail_epoll_wait:
   stop_worker_threads_force(server);
 fail_spawn_threads:
-  pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+  pthread_cancel(sigint_listener);
   sigaction(SIGINT, &sigint_old, NULL);
+  pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
   server->state = CWS_SERVER_STOPED;
   return CWS_SERVER_ERROR;
 }
